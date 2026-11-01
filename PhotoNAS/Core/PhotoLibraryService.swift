@@ -76,7 +76,9 @@ final class PhotoLibraryService {
     private let workQueue = DispatchQueue(label: "com.photonas.photolibrary", qos: .userInitiated, attributes: .concurrent)
     private let cacheLock = NSLock()
     private var collectionCache: [String: PHAssetCollection] = [:]
-    private var countCache: [String: (count: Int, date: Date)] = [:]
+    private var resultCache: [String: PHFetchResult<PHAsset>] = [:]
+    private var resultCacheDate: [String: Date] = [:]
+    private let resultCacheTTL: TimeInterval = 45
 
     var authorizationStatus: PHAuthorizationStatus {
         PHPhotoLibrary.authorizationStatus(for: .readWrite)
@@ -98,7 +100,8 @@ final class PhotoLibraryService {
     func resetCaches() {
         cacheLock.lock()
         collectionCache.removeAll()
-        countCache.removeAll()
+        resultCache.removeAll()
+        resultCacheDate.removeAll()
         cacheLock.unlock()
     }
 
@@ -111,6 +114,7 @@ final class PhotoLibraryService {
         let cached = collectionCache[identifier]
         cacheLock.unlock()
         if let cached { return cached }
+
         let fetched = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [identifier], options: nil).firstObject
         if let fetched {
             cacheLock.lock()
@@ -118,6 +122,35 @@ final class PhotoLibraryService {
             cacheLock.unlock()
         }
         return fetched
+    }
+
+    /// PHFetchResult 是惰性容器：这里只缓存索引，不遍历、不预取缩略图。
+    private func fetchResult(kind: MediaKind, albumID: String?) -> PHFetchResult<PHAsset> {
+        let key = "\(kind.rawValue)|\(albumID ?? "")"
+
+        cacheLock.lock()
+        if let cached = resultCache[key], let stamp = resultCacheDate[key], Date().timeIntervalSince(stamp) < resultCacheTTL {
+            cacheLock.unlock()
+            return cached
+        }
+        cacheLock.unlock()
+
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.predicate = kind.predicate
+
+        let result: PHFetchResult<PHAsset>
+        if let albumID, !albumID.isEmpty, let album = collection(for: albumID) {
+            result = PHAsset.fetchAssets(in: album, options: options)
+        } else {
+            result = PHAsset.fetchAssets(with: options)
+        }
+
+        cacheLock.lock()
+        resultCache[key] = result
+        resultCacheDate[key] = Date()
+        cacheLock.unlock()
+        return result
     }
 
     // MARK: - 分页查询
@@ -135,52 +168,27 @@ final class PhotoLibraryService {
         }
 
         workQueue.async {
-            let options = PHFetchOptions()
-            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-            options.predicate = kind.predicate
-            options.fetchOffset = max(0, offset)
-            options.fetchLimit = max(1, limit)
-
-            let result: PHFetchResult<PHAsset>
-            if let albumID, !albumID.isEmpty, let collection = self.collection(for: albumID) {
-                result = PHAsset.fetchAssets(in: collection, options: options)
-            } else {
-                result = PHAsset.fetchAssets(with: options)
-            }
+            let result = self.fetchResult(kind: kind, albumID: albumID)
+            let total = result.count
+            let start = min(max(0, offset), total)
+            let pageLimit = max(1, limit)
+            let end = min(start + pageLimit, total)
 
             var items: [PhotoItem] = []
-            items.reserveCapacity(result.count)
-            result.enumerateObjects { asset, _, _ in
-                items.append(PhotoItem(asset: asset))
+            items.reserveCapacity(max(0, end - start))
+            if start < end {
+                for index in start..<end {
+                    items.append(PhotoItem(asset: result.object(at: index)))
+                }
             }
 
-            let total = self.totalCount(kind: kind, albumID: albumID)
             completion(.success(PhotoPage(items: items, total: total, offset: offset, limit: limit)))
         }
     }
 
     func totalCount(kind: MediaKind, albumID: String?) -> Int {
-        let key = "\(kind.rawValue)|\(albumID ?? "all")"
-        cacheLock.lock()
-        if let entry = countCache[key], Date().timeIntervalSince(entry.date) < 30 {
-            cacheLock.unlock()
-            return entry.count
-        }
-        cacheLock.unlock()
-
-        let options = PHFetchOptions()
-        options.predicate = kind.predicate
-        let count: Int
-        if let albumID, !albumID.isEmpty, let collection = collection(for: albumID) {
-            count = PHAsset.fetchAssets(in: collection, options: options).count
-        } else {
-            count = PHAsset.fetchAssets(with: options).count
-        }
-
-        cacheLock.lock()
-        countCache[key] = (count, Date())
-        cacheLock.unlock()
-        return count
+        guard isAuthorized else { return 0 }
+        return fetchResult(kind: kind, albumID: albumID).count
     }
 
     // MARK: - 相册列表
@@ -209,25 +217,27 @@ final class PhotoLibraryService {
 
             for (subtype, fallbackName) in smart {
                 let result = PHAssetCollection.fetchAssetCollections(with: .smartAlbum, subtype: subtype, options: nil)
-                guard let collection = result.firstObject else { continue }
-                let name = collection.localizedTitle ?? fallbackName
+                guard let album = result.firstObject else { continue }
+                let name = album.localizedTitle ?? fallbackName
                 guard seenNames.insert(name).inserted else { continue }
-                let count = PHAsset.fetchAssets(in: collection, options: nil).count
+                let count = PHAsset.fetchAssets(in: album, options: nil).count
                 guard count > 0 else { continue }
                 self.cacheLock.lock()
-                self.collectionCache[collection.localIdentifier] = collection
+                self.collectionCache[album.localIdentifier] = album
                 self.cacheLock.unlock()
-                albums.append(PhotoAlbum(id: collection.localIdentifier, name: name, count: count))
+                albums.append(PhotoAlbum(id: album.localIdentifier, name: name, count: count))
             }
 
             let userAlbums = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: nil)
-            userAlbums.enumerateObjects { collection, _, _ in
-                let name = collection.localizedTitle ?? "未命名相册"
-                let count = PHAsset.fetchAssets(in: collection, options: nil).count
+            userAlbums.enumerateObjects { album, _, _ in
                 self.cacheLock.lock()
-                self.collectionCache[collection.localIdentifier] = collection
+                self.collectionCache[album.localIdentifier] = album
                 self.cacheLock.unlock()
-                albums.append(PhotoAlbum(id: collection.localIdentifier, name: name, count: count))
+                albums.append(PhotoAlbum(
+                    id: album.localIdentifier,
+                    name: album.localizedTitle ?? "未命名相册",
+                    count: PHAsset.fetchAssets(in: album, options: nil).count
+                ))
             }
 
             completion(albums)
