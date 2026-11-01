@@ -1,0 +1,81 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project PhotoNAS.xcodeproj \
+            -scheme PhotoNAS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath .build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee build.log
+
+      - name: Package IPA
+        run: |
+          APP=".build/Build/Products/Release-iphoneos/PhotoNAS.app"
+          ls -la "$APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry PhotoNAS.ipa Payload
+          ls -lh PhotoNAS.ipa
+          unzip -l PhotoNAS.ipa | head -n 20
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Upload IPA artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotoNAS-unsigned-ipa
+          path: PhotoNAS.ipa
+          if-no-files-found: error
+
+      - name: Publish release
+        if: success() && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: PhotoNAS-Latest
+          name: PhotoNAS 最新构建
+          make_latest: true
+          body: |
+            未签名 IPA，直接用 TrollStore 安装即可（无需证书、无需越狱）。
+
+            - 构建号：${{ github.run_number }}
+            - 提交：${{ github.sha }}
+          files: PhotoNAS.ipa

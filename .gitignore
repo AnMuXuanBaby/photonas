@@ -1,0 +1,8 @@
+PhotoNAS.xcodeproj/
+.build/
+build/
+DerivedData/
+*.log
+*.ipa
+Payload/
+.DS_Store
